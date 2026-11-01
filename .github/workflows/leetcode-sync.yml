@@ -1,3 +1,4 @@
+```yaml
 name: LeetCode Auto Sync
 
 on:
@@ -20,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,24 +46,34 @@ jobs:
         id: commit
         shell: bash
         run: |
+          set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add .
 
-          if ! git diff --cached --quiet; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-
-            git diff --cached --name-only > /tmp/changed-files.txt
-
-            git commit -m "Add new LeetCode solutions"
-            git push
-
-            echo "New changes pushed successfully."
-          else
+          if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
             echo "No new changes."
+            exit 0
           fi
+
+          git diff --cached --name-only > /tmp/changed-files.txt
+
+          git commit -m "Add new LeetCode solutions"
+
+          # Fetch the latest remote commits before pushing.
+          git fetch origin main
+
+          # Replay our commit on top of the latest remote main.
+          git rebase origin/main
+
+          # Push without overwriting remote commits.
+          git push origin HEAD:main
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "New changes pushed successfully."
 
       - name: Notify Discord
         if: steps.commit.outputs.has_changes == 'true'
@@ -69,7 +82,6 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           python - <<'PY'
-          import json
           import os
           import requests
 
@@ -104,3 +116,4 @@ jobs:
 
           print("Discord notification sent.")
           PY
+```
