@@ -14,12 +14,20 @@ SESSION_TOKEN = os.environ.get("LEETCODE_SESSION", "").strip()
 CSRF_TOKEN = os.environ.get("LEETCODE_CSRF_TOKEN", "").strip()
 USERNAME = os.environ.get("LEETCODE_USERNAME", "").strip()
 
+# Number of recent submissions to request.
+SUBMISSION_LIMIT = 50
+
+# Set to True to replace existing solutions with newly accepted code.
+OVERWRITE_EXISTING_SOLUTIONS = False
+
 LANGUAGE_EXTENSIONS = {
     "cpp": "cpp",
     "c++": "cpp",
     "c": "c",
     "python": "py",
     "python3": "py",
+    "pythonml": "py",
+    "pythondata": "py",
     "java": "java",
     "javascript": "js",
     "typescript": "ts",
@@ -38,16 +46,14 @@ LANGUAGE_EXTENSIONS = {
     "mssql": "sql",
     "oraclesql": "sql",
     "postgresql": "sql",
-    "pythonml": "py",
-    "pythondata": "py",
 }
 
 
 def make_session():
     if not SESSION_TOKEN or not USERNAME:
         raise RuntimeError(
-            "Missing LEETCODE_SESSION or LEETCODE_USERNAME "
-            "in GitHub Secrets."
+            "Missing LEETCODE_SESSION or LEETCODE_USERNAME. "
+            "Configure these in GitHub Actions Secrets."
         )
 
     session = requests.Session()
@@ -64,15 +70,14 @@ def make_session():
             CSRF_TOKEN,
             domain=".leetcode.com",
         )
+        session.headers["x-csrftoken"] = CSRF_TOKEN
 
     session.headers.update({
         "Content-Type": "application/json",
         "Referer": "https://leetcode.com/",
-        "User-Agent": "LeetCode-GitHub-Actions-Sync/1.0",
+        "Origin": "https://leetcode.com",
+        "User-Agent": "LeetCode-GitHub-Actions-Sync/2.0",
     })
-
-    if CSRF_TOKEN:
-        session.headers["x-csrftoken"] = CSRF_TOKEN
 
     return session
 
@@ -87,8 +92,20 @@ def graphql(session, query, variables):
         timeout=30,
     )
 
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            "LeetCode rejected the request. "
+            "Your session cookie may have expired."
+        )
+
     response.raise_for_status()
-    result = response.json()
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "LeetCode returned an invalid JSON response."
+        ) from exc
 
     if result.get("errors"):
         messages = "; ".join(
@@ -97,7 +114,7 @@ def graphql(session, query, variables):
         )
         raise RuntimeError(f"LeetCode GraphQL error: {messages}")
 
-    if "data" not in result or result["data"] is None:
+    if result.get("data") is None:
         raise RuntimeError("LeetCode returned no GraphQL data.")
 
     return result["data"]
@@ -108,24 +125,36 @@ def load_state():
         return {"processed_submission_ids": []}
 
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+        if not isinstance(state, dict):
+            raise ValueError("State must be a JSON object.")
+
+        state.setdefault("processed_submission_ids", [])
+
+        return state
+
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
         raise RuntimeError(
-            f"Cannot read {STATE_FILE}: {exc}"
+            f"Could not read {STATE_FILE}: {exc}"
         ) from exc
 
 
 def save_state(state):
-    STATE_FILE.write_text(
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+
+    temporary_file.write_text(
         json.dumps(state, indent=2),
         encoding="utf-8",
     )
 
+    temporary_file.replace(STATE_FILE)
+
 
 def get_recent_accepted_submissions(session):
     query = """
-    query recentAccepted($username: String!) {
-        recentAcSubmissionList(username: $username) {
+    query recentAccepted($username: String!, $limit: Int) {
+        recentAcSubmissionList(username: $username, limit: $limit) {
             id
             title
             titleSlug
@@ -136,20 +165,34 @@ def get_recent_accepted_submissions(session):
     }
     """
 
-    data = graphql(session, query, {"username": USERNAME})
+    data = graphql(
+        session,
+        query,
+        {
+            "username": USERNAME,
+            "limit": SUBMISSION_LIMIT,
+        },
+    )
+
     submissions = data.get("recentAcSubmissionList")
 
     if submissions is None:
         raise RuntimeError(
-            "LeetCode did not return a submission list. "
-            "Check your username and session credentials."
+            "LeetCode returned no submission list. "
+            "Verify your username and session."
         )
 
-    return [
+    print(f"Retrieved {len(submissions)} recent submissions.")
+
+    accepted = [
         submission
         for submission in submissions
         if submission.get("statusDisplay", "").lower() == "accepted"
     ]
+
+    print(f"Accepted submissions found: {len(accepted)}")
+
+    return accepted
 
 
 def get_submission_details(session, submission_id):
@@ -183,21 +226,22 @@ def get_submission_details(session, submission_id):
             f"Could not retrieve submission {submission_id}."
         )
 
-    # LeetCode statusCode 10 represents an accepted submission.
     if details.get("statusCode") != 10:
         raise RuntimeError(
-            f"Submission {submission_id} is no longer confirmed as accepted."
+            f"Submission {submission_id} is not confirmed accepted."
         )
 
-    if not details.get("code"):
+    code = details.get("code")
+
+    if not isinstance(code, str) or not code.strip():
         raise RuntimeError(
-            f"Submission {submission_id} returned no source code."
+            f"Submission {submission_id} contains no source code."
         )
 
     return details
 
 
-def get_problem_number(session, title_slug):
+def get_problem_details(session, title_slug):
     query = """
     query questionDetails($titleSlug: String!) {
         question(titleSlug: $titleSlug) {
@@ -221,25 +265,30 @@ def get_problem_number(session, title_slug):
             f"Could not find the problem number for {title_slug}."
         )
 
-    return str(question["questionFrontendId"]), question["title"]
+    return (
+        str(question["questionFrontendId"]),
+        question.get("title") or title_slug,
+    )
 
 
 def safe_folder_name(text):
     text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", text)
     text = re.sub(r"\s+", "-", text.strip())
     text = re.sub(r"-+", "-", text)
+
     return text.strip(".- ") or "Unknown-Problem"
 
 
 def get_extension(language):
-    normalized = language.strip().lower().replace(" ", "")
+    normalized = language.strip().lower()
+    normalized = normalized.replace(" ", "")
 
     extension = LANGUAGE_EXTENSIONS.get(normalized)
 
     if not extension:
         raise RuntimeError(
-            f"Unsupported language '{language}'. "
-            "Add its file extension to LANGUAGE_EXTENSIONS."
+            f"Unsupported language: {language!r}. "
+            "Add its extension to LANGUAGE_EXTENSIONS."
         )
 
     return extension
@@ -251,8 +300,8 @@ def write_solution(session, submission):
 
     details = get_submission_details(session, submission_id)
 
-    # Use the language from the actual submitted code.
     language_info = details.get("lang") or {}
+
     language = (
         language_info.get("name")
         or submission.get("lang")
@@ -261,28 +310,48 @@ def write_solution(session, submission):
 
     extension = get_extension(language)
 
-    problem_number, problem_title = get_problem_number(session, slug)
+    problem_number, problem_title = get_problem_details(
+        session,
+        slug,
+    )
 
-    folder = (
+    folder_name = (
         f"{problem_number}-"
         f"{safe_folder_name(problem_title)}"
     )
 
-    solution_path = Path(folder) / f"solution.{extension}"
-    solution_path.parent.mkdir(parents=True, exist_ok=True)
+    folder = Path(folder_name)
+    folder.mkdir(parents=True, exist_ok=True)
 
-    # Avoid replacing an existing solution for the same problem/language.
-    # This preserves your original saved solution.
+    solution_path = folder / f"solution.{extension}"
+
+    code = details["code"]
+
+    if solution_path.exists() and not OVERWRITE_EXISTING_SOLUTIONS:
+        existing_code = solution_path.read_text(encoding="utf-8")
+
+        if existing_code == code:
+            print(f"Unchanged solution: {solution_path}")
+            return False
+
+        print(
+            f"Existing solution preserved: {solution_path}. "
+            "Enable OVERWRITE_EXISTING_SOLUTIONS to replace it."
+        )
+        return False
+
     if solution_path.exists():
-        print(f"Already exists: {solution_path}")
-        return
+        existing_code = solution_path.read_text(encoding="utf-8")
 
-    solution_path.write_text(
-        details["code"],
-        encoding="utf-8",
-    )
+        if existing_code == code:
+            print(f"Unchanged solution: {solution_path}")
+            return False
 
-    print(f"Saved: {solution_path}")
+    solution_path.write_text(code, encoding="utf-8")
+
+    print(f"Saved solution: {solution_path}")
+
+    return True
 
 
 def main():
@@ -296,8 +365,9 @@ def main():
 
     submissions = get_recent_accepted_submissions(session)
 
-    # Process older submissions first.
-    submissions.sort(key=lambda item: int(item.get("timestamp", 0)))
+    submissions.sort(
+        key=lambda item: int(item.get("timestamp", 0))
+    )
 
     new_submissions = [
         submission
@@ -306,35 +376,54 @@ def main():
     ]
 
     if not new_submissions:
-        print("No new accepted submissions found.")
+        print(
+            "No unprocessed accepted submissions found "
+            "in the recent submission list."
+        )
         return
 
-    print(f"Found {len(new_submissions)} new accepted submission(s).")
+    print(
+        f"New submissions to process: {len(new_submissions)}"
+    )
 
-    # Save state only after each submission has been processed successfully.
+    saved_count = 0
+    skipped_count = 0
+
     for submission in new_submissions:
         submission_id = str(submission["id"])
 
         try:
-            write_solution(session, submission)
+            saved = write_solution(session, submission)
+
+            if saved:
+                saved_count += 1
+            else:
+                skipped_count += 1
+
+            # Mark processed only after handling the submission.
+            processed.add(submission_id)
+
+            state["processed_submission_ids"] = sorted(
+                processed,
+                key=lambda value: int(value),
+            )
+
+            save_state(state)
+
         except Exception as exc:
             print(
-                f"Failed to process submission {submission_id}: {exc}",
+                f"Failed submission {submission_id}: {exc}",
                 file=sys.stderr,
             )
             raise
 
-        processed.add(submission_id)
-
-        state["processed_submission_ids"] = sorted(
-            processed,
-            key=lambda value: int(value),
-        )
-        save_state(state)
-
-        # Keep requests modest to avoid unnecessary API traffic.
         time.sleep(1)
 
+    print("\n========== SYNC SUMMARY ==========")
+    print(f"Processed submissions: {len(new_submissions)}")
+    print(f"New or updated solution files: {saved_count}")
+    print(f"Skipped existing solution files: {skipped_count}")
+    print("==================================")
     print("LeetCode sync completed successfully.")
 
 
