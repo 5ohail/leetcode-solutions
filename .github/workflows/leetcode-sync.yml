@@ -1,4 +1,3 @@
-```yaml
 name: LeetCode Auto Sync
 
 on:
@@ -123,4 +122,3 @@ jobs:
 
           print("Discord notification sent successfully.")
           PY
-```
