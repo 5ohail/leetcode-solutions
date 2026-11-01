@@ -1,3 +1,4 @@
+```yaml
 name: LeetCode Auto Sync
 
 on:
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -54,7 +56,7 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            echo "No new changes."
+            echo "No new changes to commit."
             exit 0
           fi
 
@@ -62,8 +64,11 @@ jobs:
 
           git commit -m "Add new LeetCode solutions"
 
+          # Integrate the latest remote changes.
           git fetch origin main
           git rebase origin/main
+
+          # Push only after a successful rebase.
           git push origin HEAD:main
 
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
@@ -76,15 +81,26 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
+          set -euo pipefail
+
           python - <<'PY'
           import os
           import requests
 
-          webhook = os.environ["DISCORD_WEBHOOK_URL"]
+          webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
           repository = os.environ["REPOSITORY"]
 
+          if not webhook:
+              raise RuntimeError(
+                  "DISCORD_WEBHOOK_URL secret is missing."
+              )
+
           with open("/tmp/changed-files.txt", encoding="utf-8") as f:
-              files = [line.strip() for line in f if line.strip()]
+              files = [
+                  line.strip()
+                  for line in f
+                  if line.strip()
+              ]
 
           content = (
               "🚀 **LeetCode repository updated!**\n"
@@ -101,9 +117,10 @@ jobs:
           response = requests.post(
               webhook,
               json={"content": content},
-              timeout=20
+              timeout=20,
           )
           response.raise_for_status()
 
-          print("Discord notification sent.")
+          print("Discord notification sent successfully.")
           PY
+```
